@@ -7,104 +7,135 @@ import time
 from sklearn.ensemble import RandomForestRegressor
 
 # ==========================================
-# 1. DATABASE & ML CONFIG
+# 1. DATABASE & ML CONFIGURATION
 # ==========================================
 FIREBASE_URL = "https://biochamber-52607-default-rtdb.firebaseio.com/"
 
 @st.cache_resource
-def train_biomodel():
-    # Model remains the same - trained on your parameter names
+def train_control_model():
+    # Training a model to understand "Growth Efficiency"
+    # Inputs: [temp, ph, oxygen, od] -> Output: Growth Score (0 to 1)
     np.random.seed(42)
-    data = []
-    for _ in range(1000):
-        t = np.random.uniform(20, 45)
-        p = np.random.uniform(4, 9)
+    X = []
+    y = []
+    for _ in range(1200):
+        t = np.random.uniform(15, 50)
+        p = np.random.uniform(3, 10)
         do = np.random.uniform(0, 100)
-        od = np.random.uniform(0, 2)
-        dist = np.sqrt((t - 37)**2 + ((p - 7)*5)**2) 
-        growth = max(0, 1.0 - (dist / 20))
-        data.append([t, p, do, od, growth])
+        od = np.random.uniform(0, 5)
+        
+        # Logic: Efficiency drops if any parameter deviates from E.coli optima (37C, 7pH, 40% DO)
+        t_score = np.exp(-((t - 37)**2) / 50)
+        p_score = np.exp(-((p - 7)**2) / 2)
+        do_score = np.exp(-((do - 40)**2) / 1000)
+        efficiency = (t_score * p_score * do_score)
+        
+        X.append([t, p, do, od])
+        y.append(efficiency)
     
-    df = pd.DataFrame(data, columns=['temperature', 'ph', 'dissolved_oxygen', 'optical_density', 'growth'])
-    model = RandomForestRegressor(n_estimators=50)
-    model.fit(df[['temperature', 'ph', 'dissolved_oxygen', 'optical_density']], df['growth'])
+    model = RandomForestRegressor(n_estimators=100)
+    model.fit(X, y)
     return model
 
-ai_model = train_biomodel()
+ai_brain = train_control_model()
 
 # ==========================================
-# 2. STATIC UI (This part NEVER flickers)
+# 2. UI LAYOUT & SETTINGS
 # ==========================================
-st.set_page_config(page_title="BioChamber LIVE", layout="wide")
+st.set_page_config(page_title="BioChamber AI", layout="wide")
+st.title("🧪 BioChamber: Microbial Intelligence System")
 
-st.title("🌿 BioChamber AI Dashboard")
-st.caption("Live connection to Firebase Monitoring System")
+# Sidebar: Selection of Microbe Profile
+st.sidebar.header("Microbe Profile")
+microbe = st.sidebar.selectbox("Current Microorganism", ["E. coli", "S. cerevisiae (Yeast)", "Custom"])
 
-# Sidebar for targets (Static)
-st.sidebar.header("🎯 Target Settings")
-target_temp = st.sidebar.number_input("Optimal Temp (°C)", value=37.0)
-target_ph = st.sidebar.number_input("Optimal pH", value=7.0)
-st.sidebar.divider()
-st.sidebar.write("The AI updates the IoT control node every 5 seconds.")
+if microbe == "E. coli":
+    ideal_t, ideal_p, ideal_do = 37.0, 7.0, 40.0
+elif microbe == "S. cerevisiae (Yeast)":
+    ideal_t, ideal_p, ideal_do = 30.0, 5.0, 20.0
+else:
+    ideal_t = st.sidebar.number_input("Custom Ideal Temp", value=37.0)
+    ideal_p = st.sidebar.number_input("Custom Ideal pH", value=7.0)
+    ideal_do = st.sidebar.number_input("Custom Ideal DO (%)", value=40.0)
 
 # ==========================================
-# 3. DYNAMIC FRAGMENT (Only this part refreshes)
+# 3. DYNAMIC FRAGMENT (Two Sections)
 # ==========================================
-@st.fragment(run_every=5)  # <--- This is the magic part!
-def monitor_live_data():
+@st.fragment(run_every=5)
+def process_bioreactor():
     try:
-        # Fetch from 'live_readings'
+        # PULL FROM 'live_readings'
         response = requests.get(f"{FIREBASE_URL}/live_readings.json")
-        sensor_data = response.json()
+        data = response.json()
         
-        if sensor_data:
-            t = float(sensor_data.get('temperature', 0))
-            p = float(sensor_data.get('ph', 0))
-            do = float(sensor_data.get('dissolved_oxygen', 0))
-            od = float(sensor_data.get('optical_density', 0))
+        if data:
+            # MAP TO YOUR DATABASE KEYS
+            cur_t = float(data.get('temperature', 0))
+            cur_p = float(data.get('ph', 0))
+            cur_do = float(data.get('dissolved_oxygen', 0))
+            cur_od = float(data.get('optical_density', 0))
 
-            # AI Calculation
-            features = np.array([[t, p, do, od]])
-            growth_eff = ai_model.predict(features)[0]
+            # AI: Predict Growth Efficiency
+            current_features = np.array([[cur_t, cur_p, cur_do, cur_od]])
+            efficiency = ai_brain.predict(current_features)[0]
+
+            # AI: Determine Ideal Directions (Control Logic)
+            actions = {"thermal": "STABLE", "ph_pump": "STABLE", "oxygen_flow": "STABLE"}
             
-            # Control Logic
-            directions = {"temp_instruction": "STABLE", "ph_instruction": "STABLE"}
-            if t < target_temp - 0.5: directions["temp_instruction"] = "HEAT_ON"
-            elif t > target_temp + 0.5: directions["temp_instruction"] = "COOLING_ON"
-            if p < target_ph - 0.2: directions["ph_instruction"] = "ADD_BASE"
-            elif p > target_ph + 0.2: directions["ph_instruction"] = "ADD_ACID"
+            # Temperature Control
+            if cur_t < ideal_t - 0.5: actions["thermal"] = "HEAT_ON"
+            elif cur_t > ideal_t + 0.5: actions["thermal"] = "COOLING_ON"
             
-            # Push to Firebase
-            requests.patch(f"{FIREBASE_URL}/control.json", data=json.dumps(directions))
+            # pH Control
+            if cur_p < ideal_p - 0.2: actions["ph_pump"] = "ADD_BASE"
+            elif cur_p > ideal_p + 0.2: actions["ph_pump"] = "ADD_ACID"
+            
+            # Dissolved Oxygen Control
+            if cur_do < ideal_do - 5: actions["oxygen_flow"] = "INCREASE_AERATION"
+            elif cur_do > ideal_do + 10: actions["oxygen_flow"] = "DECREASE_AERATION"
 
-            # DISPLAY METRICS (Inside the fragment)
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Temperature", f"{t} °C", f"{round(t-target_temp, 2)} dev")
-            m2.metric("pH", p, f"{round(p-target_ph, 2)} dev")
-            m3.metric("Growth Efficiency", f"{round(growth_eff*100, 1)}%")
-            m4.metric("OD (Biomass)", od)
+            # SYNC BACK TO FIREBASE
+            control_payload = {
+                "commands": actions,
+                "ai_growth_score": round(efficiency, 3),
+                "timestamp": time.strftime("%H:%M:%S")
+            }
+            requests.patch(f"{FIREBASE_URL}/control.json", data=json.dumps(control_payload))
 
+            # --- SECTION 1: ACTIVE SENSOR DATA ---
+            st.header("📊 Section 1: Active Sensor Data")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Temperature", f"{cur_t}°C")
+            col2.metric("pH Level", f"{cur_p}")
+            col3.metric("Dissolved Oxygen", f"{cur_do}%")
+            col4.metric("Optical Density", f"{cur_od}")
+            
+            # --- SECTION 2: MAINTAINING & AI CONTROL ---
             st.divider()
+            st.header("🤖 Section 2: AI Maintenance & Control")
             
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("🤖 AI Health Report")
-                st.progress(float(growth_eff))
-                if growth_eff < 0.8:
-                    st.warning(f"Deviation Detected. Efficiency reduced to {round(growth_eff*100)}%")
+            left, right = st.columns(2)
+            with left:
+                st.subheader("Microbe Health")
+                st.write(f"**Current Efficiency:** {round(efficiency * 100, 1)}%")
+                st.progress(float(efficiency))
+                if efficiency > 0.85:
+                    st.success("Environment is Perfectly Maintained.")
                 else:
-                    st.success("Growth parameters are within optimal range.")
+                    st.warning("AI is actively adjusting parameters to reach optimum.")
 
-            with col_b:
-                st.subheader("📡 Active IoT Instructions")
-                st.info(f"**Thermal Actuator:** {directions['temp_instruction']}")
-                st.info(f"**Chemical Pump:** {directions['ph_instruction']}")
-                st.caption(f"Last AI update: {time.strftime('%H:%M:%S')}")
+            with right:
+                st.subheader("IoT Directives")
+                st.write(f"🌡️ **Thermal:** `{actions['thermal']}`")
+                st.write(f"🧪 **pH Regulator:** `{actions['ph_pump']}`")
+                st.write(f"💨 **Aeration:** `{actions['oxygen_flow']}`")
+                st.caption(f"Last AI Revision: {control_payload['timestamp']}")
+
         else:
-            st.error("Waiting for data in '/live_readings'...")
+            st.error("⚠️ No data in 'live_readings'. Check IoT connection.")
 
     except Exception as e:
-        st.error(f"Syncing Error: {e}")
+        st.error(f"Communication Error: {e}")
 
-# Call the fragment function
-monitor_live_data()
+# Run the system
+process_bioreactor()
